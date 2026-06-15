@@ -1,0 +1,10 @@
+{
+  "25ug1byai022@bmsit.in": {
+    "name": "alexa",
+    "password_hash": "scrypt:32768:8:1$bgpZMnrJSC7javgH$5d96fd63c5db3273dcc21de6dfc03f3eca708dd46b9a38ccecf48d1958c27400875ac17208980f3c8d883350dd88b8561588bb9ed581b8d3822cb08ef0676338"
+  },
+  "demo@farmx.com": {
+    "name": "Demo Farmer",
+    "password_hash": "scrypt:32768:8:1$CkacQMCkLgU4P8qj$bb09dca496380dd6fd1560b06035a2c55edee2203beaa98b150ceb8dc532c062a99b59ef12897ccec3c538d7b9c277e6115a88e4b33f9438cb0a1ad813b85055"
+  }
+}
