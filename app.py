@@ -1,14 +1,19 @@
 import os
 import re
 import threading
+import uuid
 import webbrowser
+from functools import wraps
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, redirect, render_template_string, request, session, url_for
 from werkzeug.utils import secure_filename
+
+from auth_store import authenticate_farmer, register_farmer
 
 # Initialize Flask App
 app = Flask(__name__)
+app.secret_key = os.environ.get("FARMX_SECRET_KEY", "farmx-dev-secret-change-in-production")
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -22,6 +27,7 @@ MODEL_PATH = str(BASE_DIR / "AlexNetModel.hdf5")
 FALLBACK_MODELS = ["rec_add_attention_v1", "densenet169_v1", "mobilenetv2_v1"]
 LOW_CONFIDENCE_THRESHOLD = 0.55
 PREDICTION_TOP_K = 3
+IMAGE_TARGET_SIZE = (224, 224)
 
 model = None
 _model_load_attempted = False
@@ -143,6 +149,64 @@ CLASSES_LIST = [
     "Tomato___healthy",
 ]
 
+DISEASE_TREATMENTS = {
+    "Apple___Apple_scab": "Apply sulfur or captan fungicide early in season. Prune for airflow and remove fallen leaves.",
+    "Apple___Black_rot": "Remove mummified fruit and infected branches. Spray copper fungicide during bloom.",
+    "Apple___Cedar_apple_rust": "Remove nearby cedar/juniper hosts if possible. Use myclobutanil or sulfur sprays.",
+    "Apple___healthy": "No disease detected. Maintain balanced fertilizer and regular pruning.",
+    "Blueberry___healthy": "No disease detected. Keep acidic soil (pH 4.5–5.5) and mulch roots.",
+    "Cherry_(including_sour)___Powdery_mildew": "Improve airflow, avoid overhead watering. Spray sulfur or potassium bicarbonate.",
+    "Cherry_(including_sour)___healthy": "No disease detected. Monitor for powdery mildew in humid weather.",
+    "Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot": "Rotate crops, use resistant hybrids. Apply strobilurin fungicide if severe.",
+    "Corn_(maize)___Common_rust_": "Plant rust-resistant varieties. Apply fungicide if rust covers more than 5% of leaves.",
+    "Corn_(maize)___Northern_Leaf_Blight": "Use resistant hybrids, rotate with soybeans. Apply fungicide at tasseling if needed.",
+    "Corn_(maize)___healthy": "No disease detected. Ensure adequate nitrogen and weed control.",
+    "Grape___Black_rot": "Remove infected fruit and leaves. Apply mancozeb or captan from bud break through bloom.",
+    "Grape___Esca_(Black_Measles)": "Prune infected wood during dry weather. No cure—focus on prevention and vineyard hygiene.",
+    "Grape___Leaf_blight_(Isariopsis_Leaf_Spot)": "Remove infected leaves. Apply copper or mancozeb fungicide.",
+    "Grape___healthy": "No disease detected. Maintain canopy airflow and balanced irrigation.",
+    "Orange___Haunglongbing_(Citrus_greening)": "No cure available. Remove infected trees and control Asian citrus psyllid vectors.",
+    "Peach___Bacterial_spot": "Use copper sprays in dormancy. Plant resistant varieties and avoid overhead irrigation.",
+    "Peach___healthy": "No disease detected. Apply dormant copper spray as preventive care.",
+    "Pepper,_bell___Bacterial_spot": "Use disease-free seed, rotate crops. Apply copper bactericide preventively.",
+    "Pepper,_bell___healthy": "No disease detected. Avoid working wet plants to prevent spread.",
+    "Potato___Early_blight": "Apply chlorothalonil or mancozeb. Rotate crops and remove infected foliage.",
+    "Potato___Late_blight": "Destroy infected plants immediately. Apply copper or chlorothalonil; use certified seed.",
+    "Potato___healthy": "No disease detected. Hill soil around stems and avoid over-irrigation.",
+    "Raspberry___healthy": "No disease detected. Prune canes annually and maintain good drainage.",
+    "Soybean___healthy": "No disease detected. Rotate with corn and test soil nutrients.",
+    "Squash___Powdery_mildew": "Spray neem oil or sulfur. Plant resistant varieties and improve spacing.",
+    "Strawberry___Leaf_scorch": "Remove infected leaves. Apply fungicide and ensure good drainage.",
+    "Strawberry___healthy": "No disease detected. Mulch beds and rotate planting sites every 3 years.",
+    "Tomato___Bacterial_spot": "Use copper spray, avoid overhead watering. Remove infected leaves and rotate crops.",
+    "Tomato___Early_blight": "Remove lower infected leaves. Apply copper or chlorothalonil; mulch and stake plants.",
+    "Tomato___Late_blight": "Remove and destroy infected plants. Apply copper fungicide; avoid wet foliage.",
+    "Tomato___Leaf_Mold": "Improve greenhouse ventilation. Apply chlorothalonil or copper fungicide.",
+    "Tomato___Septoria_leaf_spot": "Remove infected lower leaves. Apply copper or mancozeb fungicide weekly.",
+    "Tomato___Spider_mites Two-spotted_spider_mite": "Spray neem oil or insecticidal soap. Increase humidity and inspect undersides of leaves.",
+    "Tomato___Target_Spot": "Apply chlorothalonil or azoxystrobin. Rotate crops and remove plant debris.",
+    "Tomato___Tomato_Yellow_Leaf_Curl_Virus": "Control whiteflies with yellow sticky traps and neem oil. Remove infected plants.",
+    "Tomato___Tomato_mosaic_virus": "No chemical cure. Remove infected plants and disinfect tools; use virus-free seed.",
+    "Tomato___healthy": "No disease detected. Stake plants and water at the base, not on leaves.",
+}
+
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("farmer_email"):
+            return redirect(url_for("login", next=request.path))
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
+def _current_farmer():
+    if not session.get("farmer_email"):
+        return None
+    return {"email": session["farmer_email"], "name": session.get("farmer_name", "Farmer")}
+
+
 COMMUNITY_POSTS = [
     {
         "user": "Farmer_Rajesh",
@@ -162,38 +226,121 @@ COMMUNITY_POSTS = [
 ]
 
 
+def _prepare_leaf_image(img_path: str, output_path: str | None = None) -> str:
+    """Enhance leaf photos for more reliable disease classification."""
+    from PIL import Image, ImageEnhance, ImageOps
+
+    img = Image.open(img_path).convert("RGB")
+    img = ImageOps.exif_transpose(img)
+
+    width, height = img.size
+    side = min(width, height)
+    left = (width - side) // 2
+    top = (height - side) // 2
+    img = img.crop((left, top, left + side, top + side))
+    img = img.resize(IMAGE_TARGET_SIZE, Image.Resampling.LANCZOS)
+    img = ImageEnhance.Contrast(img).enhance(1.12)
+    img = ImageEnhance.Sharpness(img).enhance(1.08)
+
+    save_to = output_path or img_path
+    img.save(save_to, quality=95)
+    return save_to
+
+
+def _leaf_image_variants(img_path: str) -> list[str]:
+    """Build augmented views used for test-time averaging."""
+    from PIL import Image
+
+    prepared = _prepare_leaf_image(img_path, str(UPLOAD_DIR / f"prepared_{uuid.uuid4().hex}.jpg"))
+    variants = [prepared]
+    base = Image.open(prepared).convert("RGB")
+    variants.append(str(UPLOAD_DIR / f"flip_{uuid.uuid4().hex}.jpg"))
+    base.transpose(Image.FLIP_LEFT_RIGHT).save(variants[-1], quality=95)
+    return variants
+
+
 def _keras_predict_with_tta(active_model, img_path: str, classes_list):
-    """Average predictions on original and horizontally flipped image for better accuracy."""
+    """Average predictions across multiple leaf views for better accuracy."""
     import numpy as np
     from PIL import Image
     from tensorflow.keras.preprocessing import image as keras_image
 
-    def _batch(path: str, flip: bool = False):
-        img = keras_image.load_img(path, target_size=(224, 224))
-        if flip:
-            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+    def _batch(path: str):
+        img = keras_image.load_img(path, target_size=IMAGE_TARGET_SIZE)
         x = keras_image.img_to_array(img)
         return np.expand_dims(x, axis=0) / 255.0
 
-    preds = (
-        active_model.predict(_batch(img_path), verbose=0)
-        + active_model.predict(_batch(img_path, flip=True), verbose=0)
-    ) / 2.0
-    flat = preds.flatten()
-    top_indices = np.argsort(flat)[::-1][:PREDICTION_TOP_K]
+    accum = None
+    variants = _leaf_image_variants(img_path)
+    for variant in variants:
+        batch = _batch(variant)
+        preds = active_model.predict(batch, verbose=0)
+        accum = preds if accum is None else accum + preds
+    avg = (accum / len(variants)).flatten()
+
+    top_indices = np.argsort(avg)[::-1][:PREDICTION_TOP_K]
     top_predictions = []
     for idx in top_indices:
         label = classes_list[int(idx)]
         crop, condition = parse_class_label(label)
         top_predictions.append(
-            {"crop": crop, "condition": condition, "confidence": float(flat[idx])}
+            {"crop": crop, "condition": condition, "confidence": float(avg[idx]), "label": label}
         )
     best = top_predictions[0]
     return best["crop"], best["condition"], best["confidence"], top_predictions
 
 
+def _fallback_predict_with_tta(fallback, img_path: str):
+    """Run built-in PlantVillage model on original and flipped leaf images."""
+    from PIL import Image
+
+    prepared = _prepare_leaf_image(img_path, str(UPLOAD_DIR / f"fb_{uuid.uuid4().hex}.jpg"))
+    paths = [prepared]
+    flipped = str(UPLOAD_DIR / f"fb_flip_{uuid.uuid4().hex}.jpg")
+    Image.open(prepared).convert("RGB").transpose(Image.FLIP_LEFT_RIGHT).save(flipped, quality=95)
+    paths.append(flipped)
+
+    label_scores: dict[str, float] = {}
+    for path in paths:
+        result = fallback.predict(path, top_k=PREDICTION_TOP_K)
+        label_scores[result["label"]] = label_scores.get(result["label"], 0.0) + float(
+            result.get("confidence", 0)
+        )
+        for item in result.get("top_k", []):
+            label_scores[item["label"]] = label_scores.get(item["label"], 0.0) + float(
+                item["confidence"]
+            )
+
+    for label in label_scores:
+        label_scores[label] /= len(paths)
+
+    ranked = sorted(label_scores.items(), key=lambda item: item[1], reverse=True)[:PREDICTION_TOP_K]
+    best_label, best_conf = ranked[0]
+    crop_name, condition_name = parse_class_label(best_label)
+    top_predictions = []
+    for label, conf in ranked:
+        crop, condition = parse_class_label(label)
+        top_predictions.append(
+            {"crop": crop, "condition": condition, "confidence": conf, "label": label}
+        )
+    return crop_name, condition_name, best_conf, top_predictions
+
+
+def _treatment_for_label(label: str, condition_name: str) -> str:
+    if label in DISEASE_TREATMENTS:
+        return DISEASE_TREATMENTS[label]
+    if "healthy" in label.lower():
+        return "No disease detected. Continue regular crop care and monitoring."
+    return (
+        f"Consult a local agronomist for {condition_name}. "
+        "Remove affected leaves, improve airflow, and avoid overhead watering."
+    )
+
+
 def _build_prediction_result(crop_name, condition_name, confidence, top_predictions, model_used):
     low_confidence = confidence < LOW_CONFIDENCE_THRESHOLD
+    best_label = top_predictions[0].get("label", "") if top_predictions else ""
+    treatment = _treatment_for_label(best_label, condition_name)
     return {
         "crop": crop_name,
         "condition": condition_name,
@@ -201,6 +348,8 @@ def _build_prediction_result(crop_name, condition_name, confidence, top_predicti
         "top_predictions": top_predictions,
         "model_used": model_used,
         "low_confidence": low_confidence,
+        "treatment": treatment,
+        "label": best_label,
     }
 
 
@@ -223,22 +372,12 @@ def model_predict(img_path: str):
     fallback = get_fallback_predictor()
     if fallback is not None:
         try:
-            result = fallback.predict(img_path, top_k=PREDICTION_TOP_K)
-            crop_name, condition_name = parse_class_label(result["label"])
-            confidence = float(result.get("confidence", 0))
-            top_predictions = []
-            for item in result.get("top_k", []):
-                crop, condition = parse_class_label(item["label"])
-                top_predictions.append(
-                    {"crop": crop, "condition": condition, "confidence": float(item["confidence"])}
-                )
-            if not top_predictions:
-                top_predictions = [
-                    {"crop": crop_name, "condition": condition_name, "confidence": confidence}
-                ]
-            model_used = _fallback_predictor_name or result.get("model", "PlantVillage")
+            crop_name, condition_name, confidence, top_predictions = _fallback_predict_with_tta(
+                fallback, img_path
+            )
+            model_used = _fallback_predictor_name or "PlantVillage"
             return _build_prediction_result(
-                crop_name, condition_name, confidence, top_predictions, model_used
+                crop_name, condition_name, confidence, top_predictions, f"{model_used} (TTA)"
             )
         except Exception as exc:
             print(f" [!] Built-in model prediction failed: {exc}")
@@ -491,7 +630,108 @@ def get_chatbot_reply(user_msg: str, lang: str = "en") -> str:
 
 
 # -------------------------------------------------------------
-# 2. FLASK CONTEXT REST API ENDPOINTS & ROUTES
+# 2. AUTH PAGES
+# -------------------------------------------------------------
+AUTH_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>FarmX - Farmer Login</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+    <style>
+        body {
+            min-height: 100vh;
+            background: linear-gradient(135deg, #1e5631 0%, #39D2B4 100%);
+            display: flex; align-items: center; justify-content: center;
+            font-family: 'Segoe UI', sans-serif;
+        }
+        .auth-card {
+            width: 100%; max-width: 440px;
+            background: #fff; border-radius: 16px;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.2);
+            overflow: hidden;
+        }
+        .auth-header {
+            background: #34495E; color: #fff;
+            padding: 28px 24px; text-align: center;
+        }
+        .auth-header h2 { margin: 0; font-weight: 700; }
+        .auth-tabs { display: flex; border-bottom: 1px solid #eee; }
+        .auth-tabs a {
+            flex: 1; text-align: center; padding: 14px;
+            text-decoration: none; color: #666; font-weight: 600;
+        }
+        .auth-tabs a.active { color: #1e5631; border-bottom: 3px solid #39D2B4; }
+        .auth-body { padding: 28px 24px 32px; }
+        .btn-farmx {
+            background: #39D2B4; border: none; color: #fff;
+            font-weight: 600; padding: 12px;
+        }
+        .btn-farmx:hover { background: #2bb89d; color: #fff; }
+        .alert { font-size: 0.92rem; }
+    </style>
+</head>
+<body>
+<div class="auth-card">
+    <div class="auth-header">
+        <h2>🌾 FarmX Portal</h2>
+        <p class="mb-0 mt-1 opacity-75">Smart farming for every farmer</p>
+    </div>
+    <div class="auth-tabs">
+        <a href="{{ url_for('login') }}" class="{{ 'active' if mode == 'login' else '' }}">Log In</a>
+        <a href="{{ url_for('signup') }}" class="{{ 'active' if mode == 'signup' else '' }}">Sign Up</a>
+    </div>
+    <div class="auth-body">
+        {% if message %}
+        <div class="alert alert-{{ message_type }}">{{ message }}</div>
+        {% endif %}
+
+        {% if mode == 'login' %}
+        <form method="POST" action="{{ url_for('login') }}">
+            <input type="hidden" name="next" value="{{ next_url }}">
+            <div class="mb-3">
+                <label class="form-label fw-semibold">Email ID</label>
+                <input type="email" name="email" class="form-control form-control-lg" placeholder="farmer@example.com" required autofocus>
+            </div>
+            <div class="mb-4">
+                <label class="form-label fw-semibold">Password</label>
+                <input type="password" name="password" class="form-control form-control-lg" placeholder="Enter password" required>
+            </div>
+            <button type="submit" class="btn btn-farmx w-100 btn-lg">Log In</button>
+        </form>
+        <p class="text-center text-muted mt-3 mb-0 small">
+            Not registered? <a href="{{ url_for('signup') }}">Create an account</a>
+        </p>
+        {% else %}
+        <form method="POST" action="{{ url_for('signup') }}">
+            <div class="mb-3">
+                <label class="form-label fw-semibold">Full Name</label>
+                <input type="text" name="name" class="form-control form-control-lg" placeholder="Your name" required autofocus>
+            </div>
+            <div class="mb-3">
+                <label class="form-label fw-semibold">Email ID</label>
+                <input type="email" name="email" class="form-control form-control-lg" placeholder="farmer@example.com" required>
+            </div>
+            <div class="mb-4">
+                <label class="form-label fw-semibold">Password</label>
+                <input type="password" name="password" class="form-control form-control-lg" placeholder="At least 6 characters" minlength="6" required>
+            </div>
+            <button type="submit" class="btn btn-farmx w-100 btn-lg">Sign Up</button>
+        </form>
+        <p class="text-center text-muted mt-3 mb-0 small">
+            Already have an account? <a href="{{ url_for('login') }}">Log in</a>
+        </p>
+        {% endif %}
+    </div>
+</div>
+</body>
+</html>
+"""
+
+
+# -------------------------------------------------------------
+# 3. FLASK CONTEXT REST API ENDPOINTS & ROUTES
 # -------------------------------------------------------------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -541,10 +781,14 @@ HTML_TEMPLATE = """
 <nav class="navbar navbar-expand-lg navbar-dark nav-farmx p-3 shadow-sm">
     <div class="container">
         <a class="navbar-brand fw-bold text-success" href="/">🌾 FarmX Portal</a>
-        <div class="navbar-nav ms-auto">
+        <div class="navbar-nav ms-auto align-items-center">
             <a class="nav-link {% if section=='diagnosis' %}active fw-bold text-white{% endif %}" href="/">Crop Diagnosis</a>
             <a class="nav-link {% if section=='market' %}active fw-bold text-white{% endif %}" href="/market">Market Analytics</a>
             <a class="nav-link {% if section=='community' %}active fw-bold text-white{% endif %}" href="/community">Expert Forum</a>
+            {% if farmer %}
+            <span class="nav-link text-success small">👨‍🌾 {{ farmer.name }}</span>
+            <a class="nav-link text-warning" href="/logout">Logout</a>
+            {% endif %}
         </div>
     </div>
 </nav>
@@ -704,6 +948,10 @@ $(document).ready(function () {
         }
         if (data.low_confidence) {
             html += '<div class="low-conf">⚠ Low confidence — try a clearer leaf photo with good lighting.</div>';
+        }
+        if (data.treatment) {
+            html += '<div class="mt-3 p-3 bg-light rounded text-start"><strong>Recommended care:</strong><br>' +
+                escapeHtml(data.treatment) + '</div>';
         }
         return html;
     }
@@ -886,17 +1134,84 @@ function calculateRevenue() {
 """
 
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if session.get("farmer_email"):
+        return redirect(url_for("index"))
+
+    message = ""
+    message_type = "danger"
+    next_url = request.args.get("next") or request.form.get("next") or url_for("index")
+
+    if request.method == "POST":
+        ok, farmer, err = authenticate_farmer(
+            request.form.get("email", ""), request.form.get("password", "")
+        )
+        if ok and farmer:
+            session["farmer_email"] = farmer["email"]
+            session["farmer_name"] = farmer["name"]
+            return redirect(next_url)
+        message = err
+
+    return render_template_string(
+        AUTH_TEMPLATE, mode="login", message=message, message_type=message_type, next_url=next_url
+    )
+
+
+@app.route("/signup", methods=["GET", "POST"])
+def signup():
+    if session.get("farmer_email"):
+        return redirect(url_for("index"))
+
+    message = ""
+    message_type = "success"
+
+    if request.method == "POST":
+        ok, msg = register_farmer(
+            request.form.get("name", ""),
+            request.form.get("email", ""),
+            request.form.get("password", ""),
+        )
+        message = msg
+        message_type = "success" if ok else "danger"
+        if ok:
+            return render_template_string(
+                AUTH_TEMPLATE,
+                mode="login",
+                message=msg,
+                message_type="success",
+                next_url=url_for("index"),
+            )
+
+    return render_template_string(
+        AUTH_TEMPLATE, mode="signup", message=message, message_type=message_type, next_url=url_for("index")
+    )
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
 @app.route("/")
+@login_required
 def index():
-    return render_template_string(HTML_TEMPLATE, section="diagnosis", posts=COMMUNITY_POSTS)
+    return render_template_string(
+        HTML_TEMPLATE, section="diagnosis", posts=COMMUNITY_POSTS, farmer=_current_farmer()
+    )
 
 
 @app.route("/market")
+@login_required
 def market():
-    return render_template_string(HTML_TEMPLATE, section="market", posts=COMMUNITY_POSTS)
+    return render_template_string(
+        HTML_TEMPLATE, section="market", posts=COMMUNITY_POSTS, farmer=_current_farmer()
+    )
 
 
 @app.route("/community", methods=["GET", "POST"])
+@login_required
 def community():
     if request.method == "POST":
         user = request.form.get("username", "Anonymous Farmer")
@@ -904,7 +1219,9 @@ def community():
         text = request.form.get("text", "")
         if text.strip():
             COMMUNITY_POSTS.insert(0, {"user": user, "crop": crop, "text": text, "replies": []})
-    return render_template_string(HTML_TEMPLATE, section="community", posts=COMMUNITY_POSTS)
+    return render_template_string(
+        HTML_TEMPLATE, section="community", posts=COMMUNITY_POSTS, farmer=_current_farmer()
+    )
 
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -929,10 +1246,12 @@ def _format_prediction_response(result: dict):
         "model_used": result.get("model_used", "unknown"),
         "low_confidence": result.get("low_confidence", False),
         "top_predictions": top_predictions,
+        "treatment": result.get("treatment", ""),
     }
 
 
 @app.route("/predict", methods=["POST"])
+@login_required
 def upload():
     if "file" not in request.files:
         return jsonify({"error": "No file detected."}), 400
@@ -941,7 +1260,7 @@ def upload():
     if not f or f.filename == "":
         return jsonify({"error": "Invalid file upload."}), 400
 
-    filename = secure_filename(f.filename)
+    filename = secure_filename(f.filename) or f"leaf_{uuid.uuid4().hex}.jpg"
     ext = Path(filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         return jsonify({"error": "Unsupported file type. Use an image file."}), 400
@@ -960,6 +1279,7 @@ def upload():
 
 
 @app.route("/api/market-data")
+@login_required
 def get_market_data():
     return jsonify(
         {
@@ -972,6 +1292,7 @@ def get_market_data():
 
 
 @app.route("/api/chatbot", methods=["POST"])
+@login_required
 def chatbot():
     data = request.json or {}
     user_msg = str(data.get("message", ""))
@@ -990,7 +1311,7 @@ def speech_langs():
 
 
 def _open_browser():
-    webbrowser.open_new("http://127.0.0.1:5000/")
+    webbrowser.open_new("http://127.0.0.1:5000/login")
 
 
 if __name__ == "__main__":
